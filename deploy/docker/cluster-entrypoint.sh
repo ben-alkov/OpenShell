@@ -5,14 +5,19 @@
 
 # Entrypoint script for OpenShell cluster image.
 #
-# This script configures DNS resolution for k3s when running in Docker.
+# This script configures DNS resolution for k3s when running in a container
+# (Docker or Podman).
 #
-# Problem: On Docker custom networks, /etc/resolv.conf contains 127.0.0.11
-# (Docker's internal DNS). k3s detects this loopback address and automatically
-# falls back to 8.8.8.8 - but on Docker Desktop (Mac/Windows), external UDP
-# traffic to 8.8.8.8:53 doesn't work due to network limitations. The host
-# gateway IP (host.docker.internal) is reachable but doesn't run a DNS server
-# either.
+# DNS resolution order (three-tier fallback):
+#   1. Docker iptables proxy — parse DOCKER_OUTPUT chain to discover Docker's
+#      embedded DNS (127.0.0.11) listener ports, then DNAT pod traffic to them.
+#      Only works under Docker (the chain doesn't exist under Podman).
+#   2. Container resolv.conf — extract non-loopback nameservers from the
+#      container's /etc/resolv.conf. Under Podman, aardvark-dns writes the
+#      bridge gateway IP here, which is routable from pod namespaces. Also
+#      works under Docker when the iptables path fails.
+#   3. Public DNS (8.8.8.8/8.8.4.4) — last resort. May not work behind
+#      VPNs or corporate firewalls, or on Docker Desktop (Mac/Windows).
 #
 # Solution: Use iptables to proxy DNS from the container's eth0 IP to Docker's
 # embedded DNS resolver at 127.0.0.11. Docker's DNS listens on random high
