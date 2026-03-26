@@ -85,24 +85,33 @@ DOCKER_BUILD_CACHE_DIR=${DOCKER_BUILD_CACHE_DIR:-.cache/buildkit}
 CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/images"
 mkdir -p "${CACHE_PATH}"
 
-BUILDER_ARGS=()
-CACHE_ARGS=()
-if [[ "${CONTAINER_RUNTIME}" == "docker" ]]; then
-	if [[ -n "${DOCKER_BUILDER:-}" ]]; then
-		BUILDER_ARGS=(--builder "${DOCKER_BUILDER}")
-	elif [[ -z "${DOCKER_PLATFORM:-}" && -z "${CI:-}" ]]; then
-		_ctx=$(docker context inspect --format '{{.Name}}' 2>/dev/null || echo default)
-		BUILDER_ARGS=(--builder "${_ctx}")
-	fi
+# Podman's buildx emulation (buildah) does not support --builder, --load,
+# --provenance, or buildkit cache modes. Detect it and use `docker build`
+# (which maps to `podman build`) instead.
+_buildx_backend=$(docker buildx version 2>/dev/null || true)
+IS_BUILDAH=0
+if [[ "${_buildx_backend}" == *buildah* ]]; then
+  IS_BUILDAH=1
+fi
 
-	if [[ -z "${CI:-}" ]]; then
-		if docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
-			CACHE_ARGS=(
-				--cache-from "type=local,src=${CACHE_PATH}"
-				--cache-to "type=local,dest=${CACHE_PATH},mode=max"
-			)
-		fi
-	fi
+BUILDER_ARGS=()
+if [[ "${IS_BUILDAH}" == "0" ]]; then
+  if [[ -n "${DOCKER_BUILDER:-}" ]]; then
+    BUILDER_ARGS=(--builder "${DOCKER_BUILDER}")
+  elif [[ -z "${DOCKER_PLATFORM:-}" && -z "${CI:-}" ]]; then
+    _ctx=$(docker context inspect --format '{{.Name}}' 2>/dev/null || echo default)
+    BUILDER_ARGS=(--builder "${_ctx}")
+  fi
+fi
+
+CACHE_ARGS=()
+if [[ -z "${CI:-}" && "${IS_BUILDAH}" == "0" ]]; then
+  if docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
+    CACHE_ARGS=(
+      --cache-from "type=local,src=${CACHE_PATH}"
+      --cache-to "type=local,dest=${CACHE_PATH},mode=max"
+    )
+  fi
 fi
 
 SCCACHE_ARGS=()
@@ -152,13 +161,17 @@ OUTPUT_ARGS=()
 if [[ -n "${DOCKER_OUTPUT:-}" ]]; then
 	OUTPUT_ARGS=(--output "${DOCKER_OUTPUT}")
 elif [[ "${IS_FINAL_IMAGE}" == "1" ]]; then
-	if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
-		OUTPUT_ARGS=(--push)
-	elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
-		OUTPUT_ARGS=(--push)
-	else
-		OUTPUT_ARGS=(--load)
-	fi
+  if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
+    OUTPUT_ARGS=(--push)
+  elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
+    OUTPUT_ARGS=(--push)
+  else
+    # Podman/buildah loads images into the local store by default;
+    # --load is a Docker buildx flag that buildah does not support.
+    if [[ "${IS_BUILDAH}" == "0" ]]; then
+      OUTPUT_ARGS=(--load)
+    fi
+  fi
 else
 	echo "Error: DOCKER_OUTPUT must be set when building target '${TARGET}'" >&2
 	exit 1
@@ -173,19 +186,59 @@ if [[ -n "${EXTRA_CARGO_FEATURES}" ]]; then
 	FEATURE_ARGS=(--build-arg "EXTRA_CARGO_FEATURES=${EXTRA_CARGO_FEATURES}")
 fi
 
-COMMON_BUILD_ARGS=(
-	${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}}
-	${SCCACHE_ARGS[@]+"${SCCACHE_ARGS[@]}"}
-	${VERSION_ARGS[@]+"${VERSION_ARGS[@]}"}
-	${K3S_ARGS[@]+"${K3S_ARGS[@]}"}
-	${CODEGEN_ARGS[@]+"${CODEGEN_ARGS[@]}"}
-	${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
-	--build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
-	-f "${DOCKERFILE}"
-	--target "${DOCKER_TARGET}"
-	${TAG_ARGS[@]+"${TAG_ARGS[@]}"}
-	"$@"
-)
+PROVENANCE_ARGS=()
+if [[ "${IS_BUILDAH}" == "0" ]]; then
+  PROVENANCE_ARGS=(--provenance=false)
+fi
+
+# Under Podman, the build container inherits the host's /etc/resolv.conf which
+# may contain only 127.0.0.53 (systemd-resolved stub). That loopback address
+# is unreachable from the build container's network namespace, breaking apt-get
+# and other network operations. Resolve the real upstream DNS servers and pass
+# them via --dns.
+DNS_ARGS=()
+if [[ "${IS_BUILDAH}" == "1" ]]; then
+  _resolv_file=""
+  if [[ -f /run/systemd/resolve/resolv.conf ]]; then
+    _resolv_file="/run/systemd/resolve/resolv.conf"
+  elif [[ -f /etc/resolv.conf ]]; then
+    _resolv_file="/etc/resolv.conf"
+  fi
+  if [[ -n "${_resolv_file}" ]]; then
+    while IFS= read -r ns; do
+      DNS_ARGS+=(--dns "${ns}")
+    done < <(awk '/^nameserver/ {print $2}' "${_resolv_file}" | grep -v -E '^127\.' | grep -v -E '^::1$')
+  fi
+  if [[ ${#DNS_ARGS[@]} -gt 0 ]]; then
+    echo "Injecting host DNS servers into build: ${DNS_ARGS[*]}"
+  fi
+fi
+
+# Under Podman, `docker buildx build` maps to buildah which lacks many
+# buildx-specific flags. Use `docker build` (maps to `podman build`) instead.
+BUILD_CMD="docker buildx build"
+if [[ "${IS_BUILDAH}" == "1" ]]; then
+  BUILD_CMD="docker build"
+fi
+
+${BUILD_CMD} \
+  ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
+  ${DNS_ARGS[@]+"${DNS_ARGS[@]}"} \
+  ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
+  ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
+  ${SCCACHE_ARGS[@]+"${SCCACHE_ARGS[@]}"} \
+  ${VERSION_ARGS[@]+"${VERSION_ARGS[@]}"} \
+  ${K3S_ARGS[@]+"${K3S_ARGS[@]}"} \
+  ${CODEGEN_ARGS[@]+"${CODEGEN_ARGS[@]}"} \
+  ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} \
+  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
+  -f "${DOCKERFILE}" \
+  --target "${DOCKER_TARGET}" \
+  ${TAG_ARGS[@]+"${TAG_ARGS[@]}"} \
+  ${PROVENANCE_ARGS[@]+"${PROVENANCE_ARGS[@]}"} \
+  "$@" \
+  ${OUTPUT_ARGS[@]+"${OUTPUT_ARGS[@]}"} \
+  .
 
 NOCACHE_ARGS=()
 if [[ "${DOCKER_NO_CACHE:-}" == "1" ]]; then
