@@ -1141,6 +1141,33 @@ fn find_ip6tables(iptables_path: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_init_user_namespace_detected() {
+        assert!(!is_child_user_namespace("         0          0 4294967295\n"));
+    }
+
+    #[test]
+    fn test_child_user_namespace_detected() {
+        assert!(is_child_user_namespace("         0       1000          1\n"));
+    }
+
+    #[test]
+    fn test_child_user_namespace_subuid_range() {
+        assert!(is_child_user_namespace(
+            "         0       1000          1\n      1000     100000      65536\n"
+        ));
+    }
+
+    #[test]
+    fn test_empty_uid_map() {
+        assert!(is_child_user_namespace(""));
+    }
+
+    #[test]
+    fn test_whitespace_only_uid_map() {
+        assert!(is_child_user_namespace("   \n  \n"));
+    }
+
     // These tests require root and network namespace support
     // Run with: sudo cargo test -- --ignored
 
