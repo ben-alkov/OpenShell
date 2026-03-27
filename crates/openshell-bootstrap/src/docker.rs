@@ -79,8 +79,12 @@ const REGISTRY_MODE_EXTERNAL: &str = "external";
 /// - Rootless Docker with a custom socket path outside `/run/user/` will be
 ///   misclassified as rootful (may cause cgroupns failures).
 ///
-/// For non-standard setups, set `OPENSHELL_ROOTLESS=true` or `false`
-/// explicitly in the gateway container environment.
+/// For non-standard setups where the heuristic is wrong, the bootstrap
+/// propagates `OPENSHELL_ROOTLESS=true` into the gateway container
+/// environment so downstream components (e.g., the sandbox) can read it.
+/// This function itself does not check that variable — it is purely a
+/// host-side heuristic for the bootstrap's own decisions (cgroupns mode,
+/// DNS injection, cgroup delegation checks).
 fn is_likely_rootless_runtime() -> bool {
     std::env::var("DOCKER_HOST")
         .map(|h| h.contains("/run/user/"))

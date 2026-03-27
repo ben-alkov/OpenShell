@@ -67,6 +67,7 @@ fn proxy_port(policy: &SandboxPolicy) -> u16 {
 }
 
 /// How the sandbox proxy connects to workload traffic.
+#[derive(Debug)]
 #[cfg(target_os = "linux")]
 enum ProxyNetworkMode {
     /// Full isolation: dedicated netns with veth pair.
@@ -1491,7 +1492,9 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     // no untrusted process is running yet (the child has not been forked).
     for path in &policy.filesystem.read_write {
         // Check for symlinks before touching the path.  Character/block devices
-        // (e.g. /dev/null) are legitimate read_write entries and must be allowed.
+        // (e.g. /dev/null) are legitimate read_write entries and must be allowed
+        // through without chown — they are kernel-owned and cannot have their
+        // ownership or permissions changed in a user namespace.
         if let Ok(meta) = std::fs::symlink_metadata(path) {
             if meta.file_type().is_symlink() {
                 return Err(miette::miette!(
@@ -1513,7 +1516,20 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
         }
 
         debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on read_write directory");
-        chown(path, uid, gid).into_diagnostic()?;
+        if let Err(e) = chown(path, uid, gid) {
+            if e == nix::errno::Errno::EPERM && netns::is_user_namespace() {
+                warn!(
+                    path = %path.display(),
+                    "chown failed in user namespace (rootless); \
+                     falling back to world-writable permissions"
+                );
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+                    .into_diagnostic()?;
+            } else {
+                return Err(e).into_diagnostic();
+            }
+        }
     }
 
     Ok(())

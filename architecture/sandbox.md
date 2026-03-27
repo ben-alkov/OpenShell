@@ -98,10 +98,18 @@ flowchart TD
    - Create `Arc<ProxyTlsState>` wrapping a `CertCache` and the upstream config
 
 6. **Network namespace** (Linux, proxy mode only):
-   - `NetworkNamespace::create()` builds the veth pair and namespace
-   - Opens `/var/run/netns/sandbox-{uuid}` as an FD for later `setns()`
-   - `install_bypass_rules(proxy_port)` installs iptables OUTPUT chain rules for bypass detection (fast-fail UX + diagnostic logging). See [Bypass detection](#bypass-detection).
-   - On failure: return a fatal startup error (fail-closed). Bypass rule failure is non-fatal (logged as warning).
+   - Reads `/proc/self/uid_map` to detect rootless (child user namespace).
+   - **Rootful path**: `NetworkNamespace::create()` builds the veth pair
+     and namespace. Opens `/var/run/netns/sandbox-{uuid}` as an FD for
+     later `setns()`. `install_bypass_rules(proxy_port)` installs
+     iptables OUTPUT chain rules for bypass detection. On failure:
+     return a fatal startup error (fail-closed). Bypass rule failure is
+     non-fatal (logged as warning).
+   - **Rootless path**: Skips netns creation. Sets
+     `ProxyNetworkMode::Loopback` so the proxy binds to `127.0.0.1`.
+     `install_bypass_rules_default_netns(proxy_port)` installs iptables
+     rules in the pod's own network namespace. See
+     [Rootless Mode](#rootless-mode-user-namespace-fallback).
 
 7. **Proxy startup** (proxy mode only):
    - Validate that OPA engine and identity cache are present

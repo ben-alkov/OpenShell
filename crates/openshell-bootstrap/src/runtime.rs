@@ -199,7 +199,7 @@ where
                 )));
                 break;
             }
-            Some(HealthStatusEnum::NONE | HealthStatusEnum::EMPTY) | None if attempt == 0 => {
+            Some(HealthStatusEnum::NONE | HealthStatusEnum::EMPTY) | None if attempt >= 5 => {
                 result = Some(Err(miette::miette!(
                     "gateway container does not expose a health check\n{}",
                     format_recent_logs(&recent_logs)

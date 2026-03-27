@@ -1160,6 +1160,10 @@ mod tests {
 
     #[test]
     fn test_empty_uid_map() {
+        // Empty uid_map → treat as child user namespace (safe-fail direction).
+        // If we can't determine the namespace type, assuming rootless triggers
+        // the loopback fallback instead of attempting netns creation that would
+        // fail with EPERM.
         assert!(is_child_user_namespace(""));
     }
 
