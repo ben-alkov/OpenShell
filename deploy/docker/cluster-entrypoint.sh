@@ -571,6 +571,7 @@ mkdir -p /run/flannel
 # so kubelet warns instead of refusing to start. This flag can be removed once
 # cgroup v1 support is no longer needed.
 EXTRA_KUBELET_ARGS=""
+EXTRA_K3S_ARGS=""
 if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
 	echo "Detected cgroup v1 — adding kubelet compatibility flag (fail-cgroupv1=false)"
 	EXTRA_KUBELET_ARGS="--kubelet-arg=fail-cgroupv1=false"
@@ -717,6 +718,27 @@ if [ "${CONTAINER_RUNTIME:-}" = "podman" ]; then
 			echo "Switched iptables to nft backend for flannel compatibility" || \
 			echo "Warning: could not register iptables-nft alternative — flannel may fail on nftables-only hosts" >&2
 	fi
+fi
+
+# ---------------------------------------------------------------------------
+# Warn if br_netfilter is not loaded (non-fatal)
+# ---------------------------------------------------------------------------
+# kube-proxy relies on bridge-nf-call-iptables to intercept pod-to-service
+# traffic traversing the Linux bridge. Without it, ClusterIP / NodePort
+# services won't work. This is a common issue in rootless runtimes where the
+# host module isn't loaded. We warn but don't block startup — some workloads
+# (e.g., host-network pods) work fine without it.
+if [ -f /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    BNF_VAL=$(cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || echo "0")
+    if [ "$BNF_VAL" != "1" ]; then
+        echo "Warning: bridge-nf-call-iptables is disabled (value=$BNF_VAL)"
+        echo "  Service networking (ClusterIP/NodePort) may not work correctly."
+        echo "  Fix: sudo modprobe br_netfilter && sudo sysctl net.bridge.bridge-nf-call-iptables=1"
+    fi
+elif ! $ROOTLESS; then
+    echo "Warning: /proc/sys/net/bridge/bridge-nf-call-iptables not found (br_netfilter module not loaded?)"
+    echo "  Service networking (ClusterIP/NodePort) may not work correctly."
+    echo "  Fix: sudo modprobe br_netfilter"
 fi
 
 # Execute k3s with explicit resolv-conf passed as a kubelet arg.
