@@ -53,6 +53,19 @@ pub use process::{ProcessHandle, ProcessStatus};
 /// refreshed.
 const DEFAULT_ROUTE_REFRESH_INTERVAL_SECS: u64 = 5;
 
+/// Default proxy port when no explicit address is configured.
+const DEFAULT_PROXY_PORT: u16 = 3128;
+
+/// Extract the proxy port from policy, falling back to default.
+fn proxy_port(policy: &SandboxPolicy) -> u16 {
+    policy
+        .network
+        .proxy
+        .as_ref()
+        .and_then(|p| p.http_addr)
+        .map_or(DEFAULT_PROXY_PORT, |addr| addr.port())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InferenceRouteSource {
     File,
@@ -266,13 +279,7 @@ pub async fn run_sandbox(
                 "Running in a user namespace (rootless); network namespace isolation \
                  unavailable. Proxy will bind to loopback with iptables bypass detection."
             );
-            let proxy_port = policy
-                .network
-                .proxy
-                .as_ref()
-                .and_then(|p| p.http_addr)
-                .map_or(3128, |addr| addr.port());
-            if let Err(e) = netns::install_bypass_rules_default_netns(proxy_port) {
+            if let Err(e) = netns::install_bypass_rules_default_netns(proxy_port(&policy)) {
                 warn!(
                     error = %e,
                     "Failed to install rootless bypass detection rules (non-fatal)"
@@ -285,13 +292,7 @@ pub async fn run_sandbox(
                     // Install bypass detection rules (iptables LOG + REJECT).
                     // This provides fast-fail UX and diagnostic logging for direct
                     // connection attempts that bypass the HTTP CONNECT proxy.
-                    let proxy_port = policy
-                        .network
-                        .proxy
-                        .as_ref()
-                        .and_then(|p| p.http_addr)
-                        .map_or(3128, |addr| addr.port());
-                    if let Err(e) = ns.install_bypass_rules(proxy_port) {
+                    if let Err(e) = ns.install_bypass_rules(proxy_port(&policy)) {
                         warn!(
                             error = %e,
                             "Failed to install bypass detection rules (non-fatal)"
@@ -340,11 +341,12 @@ pub async fn run_sandbox(
         // loopback instead (no veth available).
         #[cfg(target_os = "linux")]
         let bind_addr = if let Some(ns) = netns.as_ref() {
-            let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
-            Some(SocketAddr::new(ns.host_ip(), port))
+            Some(SocketAddr::new(ns.host_ip(), proxy_port(&policy)))
         } else if rootless_proxy {
-            let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
-            Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port))
+            Some(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                proxy_port(&policy),
+            ))
         } else {
             None
         };
@@ -421,21 +423,9 @@ pub async fn run_sandbox(
         #[cfg(target_os = "linux")]
         {
             if let Some(ns) = netns.as_ref() {
-                let port = policy
-                    .network
-                    .proxy
-                    .as_ref()
-                    .and_then(|p| p.http_addr)
-                    .map_or(3128, |addr| addr.port());
-                Some(format!("http://{}:{port}", ns.host_ip()))
+                Some(format!("http://{}:{}", ns.host_ip(), proxy_port(&policy)))
             } else if rootless_proxy {
-                let port = policy
-                    .network
-                    .proxy
-                    .as_ref()
-                    .and_then(|p| p.http_addr)
-                    .map_or(3128, |addr| addr.port());
-                Some(format!("http://127.0.0.1:{port}"))
+                Some(format!("http://127.0.0.1:{}", proxy_port(&policy)))
             } else {
                 None
             }
