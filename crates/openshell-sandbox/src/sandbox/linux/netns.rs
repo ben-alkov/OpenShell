@@ -822,31 +822,38 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Run an iptables command inside a network namespace.
-fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<()> {
-    let mut full_args = vec!["netns", "exec", netns, iptables_cmd];
-    full_args.extend(args);
+/// Run an iptables command, optionally inside a named netns.
+fn run_iptables(netns: Option<&str>, iptables_cmd: &str, args: &[&str]) -> Result<()> {
+    let (program, full_args): (&str, Vec<&str>) = if let Some(ns) = netns {
+        let mut fa = vec!["netns", "exec", ns, iptables_cmd];
+        fa.extend(args);
+        ("ip", fa)
+    } else {
+        (iptables_cmd, args.to_vec())
+    };
 
     debug!(
-        command = %format!("ip {}", full_args.join(" ")),
-        "Running iptables in namespace"
+        command = %if netns.is_some() {
+            format!("ip {}", full_args.join(" "))
+        } else {
+            format!("{iptables_cmd} {}", args.join(" "))
+        },
+        netns = netns.unwrap_or("default"),
+        "Running iptables"
     );
 
-    let output = Command::new("ip")
+    let output = Command::new(program)
         .args(&full_args)
         .output()
         .into_diagnostic()?;
-
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette::miette!(
-            "ip netns exec {} {} failed: {}",
-            netns,
-            iptables_cmd,
-            stderr.trim()
-        ));
+        let ctx = netns.map_or_else(
+            || format!("{iptables_cmd} {}", args.join(" ")),
+            |ns| format!("ip netns exec {ns} {iptables_cmd} {}", args.join(" ")),
+        );
+        return Err(miette::miette!("{ctx} failed: {}", stderr.trim()));
     }
-
     Ok(())
 }
 
@@ -911,20 +918,23 @@ pub fn install_bypass_rules_default_netns(proxy_port: u16) -> Result<()> {
     );
 
     // Rule 1: ACCEPT traffic to the proxy on loopback
-    run_iptables_direct(
+    run_iptables(
+        None,
         &iptables_path,
         &["-A", "OUTPUT", "-o", "lo", "-p", "tcp",
           "--dport", &proxy_port_str, "-j", "ACCEPT"],
     )?;
 
     // Rule 2: ACCEPT all other loopback traffic
-    run_iptables_direct(
+    run_iptables(
+        None,
         &iptables_path,
         &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
     )?;
 
     // Rule 3: ACCEPT established/related
-    run_iptables_direct(
+    run_iptables(
+        None,
         &iptables_path,
         &["-A", "OUTPUT", "-m", "conntrack",
           "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
