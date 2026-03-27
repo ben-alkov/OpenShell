@@ -66,6 +66,17 @@ fn proxy_port(policy: &SandboxPolicy) -> u16 {
         .map_or(DEFAULT_PROXY_PORT, |addr| addr.port())
 }
 
+/// How the sandbox proxy connects to workload traffic.
+#[cfg(target_os = "linux")]
+enum ProxyNetworkMode {
+    /// Full isolation: dedicated netns with veth pair.
+    Isolated(NetworkNamespace),
+    /// Rootless fallback: no netns, proxy on loopback.
+    Loopback,
+    /// No proxy (direct network access).
+    Disabled,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InferenceRouteSource {
     File,
@@ -273,7 +284,7 @@ pub async fn run_sandbox(
     // with EPERM. We fall back to binding the proxy on loopback and installing
     // bypass detection rules in the pod's default network namespace.
     #[cfg(target_os = "linux")]
-    let (netns, rootless_proxy) = if matches!(policy.network.mode, NetworkMode::Proxy) {
+    let proxy_mode = if matches!(policy.network.mode, NetworkMode::Proxy) {
         if netns::is_user_namespace() {
             warn!(
                 "Running in a user namespace (rootless); network namespace isolation \
@@ -285,7 +296,7 @@ pub async fn run_sandbox(
                     "Failed to install rootless bypass detection rules (non-fatal)"
                 );
             }
-            (None, true)
+            ProxyNetworkMode::Loopback
         } else {
             match NetworkNamespace::create() {
                 Ok(ns) => {
@@ -298,7 +309,7 @@ pub async fn run_sandbox(
                             "Failed to install bypass detection rules (non-fatal)"
                         );
                     }
-                    (Some(ns), false)
+                    ProxyNetworkMode::Isolated(ns)
                 }
                 Err(e) => {
                     return Err(miette::miette!(
@@ -310,13 +321,8 @@ pub async fn run_sandbox(
             }
         }
     } else {
-        (None, false)
+        ProxyNetworkMode::Disabled
     };
-
-    // On non-Linux, network namespace isolation is not supported
-    #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::no_effect_underscore_binding)]
-    let _netns: Option<()> = None;
 
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
@@ -340,15 +346,15 @@ pub async fn run_sandbox(
         // processes can reach the proxy via TCP. In rootless mode, bind to
         // loopback instead (no veth available).
         #[cfg(target_os = "linux")]
-        let bind_addr = if let Some(ns) = netns.as_ref() {
-            Some(SocketAddr::new(ns.host_ip(), proxy_port(&policy)))
-        } else if rootless_proxy {
-            Some(SocketAddr::new(
+        let bind_addr = match &proxy_mode {
+            ProxyNetworkMode::Isolated(ns) => {
+                Some(SocketAddr::new(ns.host_ip(), proxy_port(&policy)))
+            }
+            ProxyNetworkMode::Loopback => Some(SocketAddr::new(
                 IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 proxy_port(&policy),
-            ))
-        } else {
-            None
+            )),
+            ProxyNetworkMode::Disabled => None,
         };
 
         #[cfg(not(target_os = "linux"))]
@@ -394,14 +400,12 @@ pub async fn run_sandbox(
     // tracing events for direct connection attempts that bypass the proxy.
     #[cfg(target_os = "linux")]
     let _bypass_monitor = {
-        let monitor_ns_name = if let Some(ns) = netns.as_ref() {
-            Some(ns.name().to_string())
-        } else if rootless_proxy {
+        let monitor_ns_name = match &proxy_mode {
+            ProxyNetworkMode::Isolated(ns) => Some(ns.name().to_string()),
             // Matches the log prefix "openshell:bypass:rootless:"
             // installed by install_bypass_rules_default_netns().
-            Some("rootless".to_string())
-        } else {
-            None
+            ProxyNetworkMode::Loopback => Some("rootless".to_string()),
+            ProxyNetworkMode::Disabled => None,
         };
         if let Some(ns_name) = monitor_ns_name {
             bypass_monitor::spawn(ns_name, entrypoint_pid.clone(), bypass_denial_tx)
@@ -422,7 +426,10 @@ pub async fn run_sandbox(
     // - proxy_url: set proxy env vars so cooperative tools route through the
     //   CONNECT proxy; this also opts Node.js into honoring those vars
     #[cfg(target_os = "linux")]
-    let ssh_netns_fd = netns.as_ref().and_then(NetworkNamespace::ns_fd);
+    let ssh_netns_fd = match &proxy_mode {
+        ProxyNetworkMode::Isolated(ns) => ns.ns_fd(),
+        _ => None,
+    };
 
     #[cfg(not(target_os = "linux"))]
     let ssh_netns_fd: Option<i32> = None;
@@ -430,12 +437,14 @@ pub async fn run_sandbox(
     let ssh_proxy_url = if matches!(policy.network.mode, NetworkMode::Proxy) {
         #[cfg(target_os = "linux")]
         {
-            if let Some(ns) = netns.as_ref() {
-                Some(format!("http://{}:{}", ns.host_ip(), proxy_port(&policy)))
-            } else if rootless_proxy {
-                Some(format!("http://127.0.0.1:{}", proxy_port(&policy)))
-            } else {
-                None
+            match &proxy_mode {
+                ProxyNetworkMode::Isolated(ns) => {
+                    Some(format!("http://{}:{}", ns.host_ip(), proxy_port(&policy)))
+                }
+                ProxyNetworkMode::Loopback => {
+                    Some(format!("http://127.0.0.1:{}", proxy_port(&policy)))
+                }
+                ProxyNetworkMode::Disabled => None,
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -586,7 +595,10 @@ pub async fn run_sandbox(
         workdir.as_deref(),
         interactive,
         &policy,
-        netns.as_ref(),
+        match &proxy_mode {
+            ProxyNetworkMode::Isolated(ns) => Some(ns),
+            _ => None,
+        },
         ca_file_paths.as_ref(),
         &provider_env,
     )?;
