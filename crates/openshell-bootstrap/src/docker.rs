@@ -69,12 +69,18 @@ pub(crate) fn resolve_gpu_device_ids(
 
 const REGISTRY_MODE_EXTERNAL: &str = "external";
 
-/// Detect whether the container runtime is likely rootless (user-namespaced).
+/// Heuristic: detect rootless container runtime by checking if `DOCKER_HOST`
+/// points to a user-scoped socket path (`/run/user/`).
 ///
-/// Rootless Podman and rootless Docker use sockets under `/run/user/`, so
-/// checking `DOCKER_HOST` is a reliable heuristic. When rootless, the gateway
-/// container needs different cgroup and kubelet settings because the container
-/// runs inside a user namespace without real root privileges.
+/// Known limitations:
+/// - Rootful Podman with a non-standard socket in `/run/user/` will be
+///   misclassified as rootless (harmless: PRIVATE cgroupns + cgroupfs is valid
+///   for rootful, just suboptimal).
+/// - Rootless Docker with a custom socket path outside `/run/user/` will be
+///   misclassified as rootful (may cause cgroupns failures).
+///
+/// For non-standard setups, set `OPENSHELL_ROOTLESS=true` or `false`
+/// explicitly in the gateway container environment.
 fn is_likely_rootless_runtime() -> bool {
     std::env::var("DOCKER_HOST")
         .map(|h| h.contains("/run/user/"))

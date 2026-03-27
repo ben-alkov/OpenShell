@@ -1721,6 +1721,49 @@ Platform-specific code is abstracted through `crates/openshell-sandbox/src/sandb
 
 On non-Linux platforms, the sandbox can still run commands with proxy-based network filtering, but the kernel-level isolation (filesystem, syscall, namespace) and process-identity binding are unavailable.
 
+## Rootless Mode (User Namespace Fallback)
+
+When the sandbox detects it is running inside a non-init user namespace
+(rootless Podman, rootless Docker), it cannot create a dedicated network
+namespace for workload isolation. Instead, it falls back to binding the
+proxy to the pod's loopback address (`127.0.0.1`) with iptables OUTPUT
+chain rules for bypass detection.
+
+### What is preserved
+
+- L7 proxy inspection and policy enforcement (all traffic routes through
+  the proxy)
+- Seccomp and Landlock restrictions (work in user namespaces)
+- Bypass detection via iptables REJECT rules (direct connections blocked)
+- Bypass telemetry via iptables LOG rules and `/dev/kmsg` monitor
+
+### What is degraded
+
+- **Network namespace isolation**: workload traffic shares the pod's
+  default network namespace instead of being isolated in a dedicated
+  namespace with a veth pair.
+- **Bypass detection enforcement**: iptables rules are installed in the
+  pod's own network namespace. An attacker who obtains root within the
+  sandbox pod can flush these rules with `iptables -F OUTPUT`, removing
+  both bypass blocking and telemetry. In the non-rootless model, rules
+  are in the host's namespace and inaccessible from the pod.
+- **Threat model**: rootless mode is intended for development use cases
+  where the container runtime does not grant `CAP_NET_ADMIN` or
+  `CAP_SYS_ADMIN`. The weaker network isolation boundary is an accepted
+  trade-off for functionality in these environments.
+
+### Detection mechanism
+
+The sandbox reads `/proc/self/uid_map` at startup. The init user
+namespace has a single mapping covering the full 4294967295 range; child
+user namespaces have narrower mappings. This is the same heuristic used
+by `cluster-entrypoint.sh`.
+
+If `/proc/self/uid_map` cannot be read (e.g., unusual seccomp policy),
+the sandbox logs a warning and assumes it is NOT in a user namespace.
+This causes `NetworkNamespace::create()` to be attempted, which will
+fail with EPERM if the process actually lacks the required capabilities.
+
 ## Cross-References
 
 - [Overview](README.md) -- System-wide architecture context
