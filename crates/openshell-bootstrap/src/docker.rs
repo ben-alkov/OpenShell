@@ -123,9 +123,10 @@ fn resolve_host_dns_servers() -> Vec<String> {
             .collect();
 
         if !servers.is_empty() {
-            eprintln!(
-                "Resolved host DNS servers from {path}: {}",
-                servers.join(", ")
+            tracing::debug!(
+                path,
+                servers = %servers.join(", "),
+                "Resolved host DNS servers"
             );
             return servers;
         }
@@ -150,13 +151,16 @@ fn check_rootless_cgroup_delegation() -> Result<()> {
     // which is where systemd's Delegate= setting controls available controllers.
     // e.g. /user.slice/user-1000.slice/user@1000.service/app.slice/...
     let delegation_cgroup = user_cgroup
-        .find("user@")
-        .and_then(|start| {
-            user_cgroup[start..]
-                .find('/')
-                .map(|end| &user_cgroup[..start + end])
+        .split('/')
+        .position(|seg| seg.starts_with("user@"))
+        .map(|pos| {
+            user_cgroup
+                .split('/')
+                .take(pos + 1)
+                .collect::<Vec<_>>()
+                .join("/")
         })
-        .unwrap_or(user_cgroup);
+        .unwrap_or_else(|| user_cgroup.to_string());
 
     let path = format!("/sys/fs/cgroup{delegation_cgroup}/cgroup.controllers");
     let controllers = std::fs::read_to_string(&path).unwrap_or_default();
