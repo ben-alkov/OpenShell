@@ -69,6 +69,65 @@ pub(crate) fn resolve_gpu_device_ids(
 
 const REGISTRY_MODE_EXTERNAL: &str = "external";
 
+/// Detect whether the container runtime is likely rootless (user-namespaced).
+///
+/// Rootless Podman and rootless Docker use sockets under `/run/user/`, so
+/// checking `DOCKER_HOST` is a reliable heuristic. When rootless, the gateway
+/// container needs different cgroup and kubelet settings because the container
+/// runs inside a user namespace without real root privileges.
+fn is_likely_rootless_runtime() -> bool {
+    std::env::var("DOCKER_HOST")
+        .map(|h| h.contains("/run/user/"))
+        .unwrap_or(false)
+}
+
+/// Verify that the host's systemd user session delegates the cgroup controllers
+/// required by k3s (specifically `cpuset`). Without delegation, k3s inside a
+/// rootless container fails with "failed to find cpuset cgroup (v2)".
+fn check_rootless_cgroup_delegation() -> Result<()> {
+    // Parse /proc/self/cgroup to find the user's cgroup path (works for any UID).
+    // On cgroup v2 the format is: 0::<path>
+    let cgroup_entry = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let user_cgroup = cgroup_entry
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .unwrap_or("");
+
+    // Walk up from the process cgroup to find the user@<uid>.service level,
+    // which is where systemd's Delegate= setting controls available controllers.
+    // e.g. /user.slice/user-1000.slice/user@1000.service/app.slice/...
+    let delegation_cgroup = user_cgroup
+        .find("user@")
+        .and_then(|start| {
+            user_cgroup[start..]
+                .find('/')
+                .map(|end| &user_cgroup[..start + end])
+        })
+        .unwrap_or(user_cgroup);
+
+    let path = format!("/sys/fs/cgroup{delegation_cgroup}/cgroup.controllers");
+    let controllers = std::fs::read_to_string(&path).unwrap_or_default();
+    if !controllers.split_whitespace().any(|c| c == "cpuset") {
+        miette::bail!(
+            "Rootless container runtime requires the `cpuset` cgroup controller to be \
+             delegated by systemd, but it is not present in {path}.\n\
+             \n\
+             Current controllers: {controllers}\
+             \n\
+             Fix this by running:\n\
+             \n  sudo mkdir -p /etc/systemd/system/user@.service.d\n  \
+             sudo tee /etc/systemd/system/user@.service.d/delegate.conf <<'EOF'\n  \
+             [Service]\n  \
+             Delegate=cpu cpuset io memory pids\n  \
+             EOF\n  \
+             sudo systemctl daemon-reload\n\
+             \n\
+             Then log out and back in for the change to take effect."
+        );
+    }
+    Ok(())
+}
+
 fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -794,7 +853,21 @@ pub async fn ensure_container(
         "--tls-san=localhost".to_string(),
         format!("--tls-san={DOCKER_HOST_GATEWAY_ALIAS}"),
         format!("--tls-san={PODMAN_HOST_GATEWAY_ALIAS}"),
+        "--kubelet-arg=feature-gates=KubeletInUserNamespace=true".to_string(),
     ];
+
+    if rootless {
+        // Under rootless with private cgroupns, the container's cgroup root
+        // inherits domain controllers from systemd delegation. The default
+        // systemd cgroup driver conflicts with this layout — kubelet fails
+        // with "cannot enter cgroupv2 with domain controllers". Use cgroupfs
+        // driver instead (no systemd runs inside the container anyway).
+        // Also skip top-level cgroup enforcement (kubepods, system-reserved)
+        // which can't be created under the delegated subtree.
+        cmd.push("--kubelet-arg=cgroup-driver=cgroupfs".to_string());
+        cmd.push("--kubelet-arg=enforce-node-allocatable=".to_string());
+    }
+
     for san in extra_sans {
         cmd.push(format!("--tls-san={san}"));
     }
