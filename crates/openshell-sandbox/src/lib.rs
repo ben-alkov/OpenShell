@@ -393,14 +393,22 @@ pub async fn run_sandbox(
     // Reads /dev/kmsg for iptables LOG entries and emits structured
     // tracing events for direct connection attempts that bypass the proxy.
     #[cfg(target_os = "linux")]
-    let _bypass_monitor = if netns.is_some() {
-        bypass_monitor::spawn(
-            netns.as_ref().expect("netns is Some").name().to_string(),
-            entrypoint_pid.clone(),
-            bypass_denial_tx,
-        )
-    } else {
-        None
+    let _bypass_monitor = {
+        let monitor_ns_name = if let Some(ns) = netns.as_ref() {
+            Some(ns.name().to_string())
+        } else if rootless_proxy {
+            // Matches the log prefix "openshell:bypass:rootless:"
+            // installed by install_bypass_rules_default_netns().
+            Some("rootless".to_string())
+        } else {
+            None
+        };
+        if let Some(ns_name) = monitor_ns_name {
+            bypass_monitor::spawn(ns_name, entrypoint_pid.clone(), bypass_denial_tx)
+        } else {
+            drop(bypass_denial_tx);
+            None
+        }
     };
 
     // On non-Linux, bypass_denial_tx is unused (no /dev/kmsg).
