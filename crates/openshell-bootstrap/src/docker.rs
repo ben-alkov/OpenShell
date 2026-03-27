@@ -81,6 +81,59 @@ fn is_likely_rootless_runtime() -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the host's actual DNS servers for injection into rootless containers.
+///
+/// systemd-resolved (common on Fedora, Ubuntu) binds a stub listener on
+/// `127.0.0.53`. When Podman copies the host's `/etc/resolv.conf` into the
+/// container, this loopback address is the only nameserver — but it is
+/// unreachable from k3s pod network namespaces, breaking all DNS.
+///
+/// This function reads the real upstream servers that systemd-resolved
+/// forwards to (`/run/systemd/resolve/resolv.conf`), falling back to
+/// filtering loopback entries from `/etc/resolv.conf`.
+fn resolve_host_dns_servers() -> Vec<String> {
+    // Prefer systemd-resolved's upstream config — it contains the real
+    // nameserver IPs (e.g., 192.168.1.1) rather than the stub 127.0.0.53.
+    let candidates = ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"];
+
+    for path in &candidates {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let servers: Vec<String> = content
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("nameserver") {
+                    let ns = rest.trim();
+                    // Filter out loopback addresses — they are only reachable
+                    // from the container's own network namespace, not from k3s
+                    // pod namespaces.
+                    if ns.starts_with("127.") || ns == "::1" {
+                        None
+                    } else {
+                        Some(ns.to_string())
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !servers.is_empty() {
+            eprintln!(
+                "Resolved host DNS servers from {path}: {}",
+                servers.join(", ")
+            );
+            return servers;
+        }
+    }
+
+    Vec::new()
+}
+
 /// Verify that the host's systemd user session delegates the cgroup controllers
 /// required by k3s (specifically `cpuset`). Without delegation, k3s inside a
 /// rootless container fails with "failed to find cpuset cgroup (v2)".
@@ -791,9 +844,26 @@ pub async fn ensure_container(
         HostConfigCgroupnsModeEnum::HOST
     };
 
+    // Under rootless runtimes, the host's /etc/resolv.conf often has only
+    // 127.0.0.53 (systemd-resolved stub), which Podman copies into the
+    // container. That loopback address is unreachable from k3s pod namespaces.
+    // Resolve the real upstream DNS servers and inject them via the API so the
+    // container gets usable nameservers in /etc/resolv.conf.
+    let dns = if rootless {
+        let servers = resolve_host_dns_servers();
+        if servers.is_empty() {
+            None
+        } else {
+            Some(servers)
+        }
+    } else {
+        None
+    };
+
     let mut host_config = HostConfig {
         privileged: Some(true),
         cgroupns_mode: Some(cgroupns),
+        dns,
         port_bindings: Some(port_bindings),
         binds: Some(vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))]),
         network_mode: Some(network_name(name)),
