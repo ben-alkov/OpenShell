@@ -25,7 +25,7 @@ mod ssh;
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(target_os = "linux")]
@@ -42,7 +42,7 @@ use crate::opa::OpaEngine;
 use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
-use crate::sandbox::linux::netns::NetworkNamespace;
+use crate::sandbox::linux::netns::{self as netns, NetworkNamespace};
 use crate::secrets::SecretResolver;
 pub use process::{ProcessHandle, ProcessStatus};
 
@@ -255,37 +255,61 @@ pub async fn run_sandbox(
     // Create network namespace for proxy mode (Linux only)
     // This must be created before the proxy AND SSH server so that SSH
     // sessions can enter the namespace for network isolation.
+    //
+    // In rootless (user namespace) mode, network namespace creation fails
+    // with EPERM. We fall back to binding the proxy on loopback and installing
+    // bypass detection rules in the pod's default network namespace.
     #[cfg(target_os = "linux")]
-    let netns = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        match NetworkNamespace::create() {
-            Ok(ns) => {
-                // Install bypass detection rules (iptables LOG + REJECT).
-                // This provides fast-fail UX and diagnostic logging for direct
-                // connection attempts that bypass the HTTP CONNECT proxy.
-                let proxy_port = policy
-                    .network
-                    .proxy
-                    .as_ref()
-                    .and_then(|p| p.http_addr)
-                    .map_or(3128, |addr| addr.port());
-                if let Err(e) = ns.install_bypass_rules(proxy_port) {
-                    warn!(
-                        error = %e,
-                        "Failed to install bypass detection rules (non-fatal)"
-                    );
-                }
-                Some(ns)
+    let (netns, rootless_proxy) = if matches!(policy.network.mode, NetworkMode::Proxy) {
+        if netns::is_user_namespace() {
+            warn!(
+                "Running in a user namespace (rootless); network namespace isolation \
+                 unavailable. Proxy will bind to loopback with iptables bypass detection."
+            );
+            let proxy_port = policy
+                .network
+                .proxy
+                .as_ref()
+                .and_then(|p| p.http_addr)
+                .map_or(3128, |addr| addr.port());
+            if let Err(e) = netns::install_bypass_rules_default_netns(proxy_port) {
+                warn!(
+                    error = %e,
+                    "Failed to install rootless bypass detection rules (non-fatal)"
+                );
             }
-            Err(e) => {
-                return Err(miette::miette!(
-                    "Network namespace creation failed and proxy mode requires isolation. \
-                     Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
-                     Error: {e}"
-                ));
+            (None, true)
+        } else {
+            match NetworkNamespace::create() {
+                Ok(ns) => {
+                    // Install bypass detection rules (iptables LOG + REJECT).
+                    // This provides fast-fail UX and diagnostic logging for direct
+                    // connection attempts that bypass the HTTP CONNECT proxy.
+                    let proxy_port = policy
+                        .network
+                        .proxy
+                        .as_ref()
+                        .and_then(|p| p.http_addr)
+                        .map_or(3128, |addr| addr.port());
+                    if let Err(e) = ns.install_bypass_rules(proxy_port) {
+                        warn!(
+                            error = %e,
+                            "Failed to install bypass detection rules (non-fatal)"
+                        );
+                    }
+                    (Some(ns), false)
+                }
+                Err(e) => {
+                    return Err(miette::miette!(
+                        "Network namespace creation failed and proxy mode requires isolation. \
+                         Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
+                         Error: {e}"
+                    ));
+                }
             }
         }
     } else {
-        None
+        (None, false)
     };
 
     // On non-Linux, network namespace isolation is not supported
@@ -312,12 +336,18 @@ pub async fn run_sandbox(
         })?;
 
         // If we have a network namespace, bind to the veth host IP so sandboxed
-        // processes can reach the proxy via TCP.
+        // processes can reach the proxy via TCP. In rootless mode, bind to
+        // loopback instead (no veth available).
         #[cfg(target_os = "linux")]
-        let bind_addr = netns.as_ref().map(|ns| {
+        let bind_addr = if let Some(ns) = netns.as_ref() {
             let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
-            SocketAddr::new(ns.host_ip(), port)
-        });
+            Some(SocketAddr::new(ns.host_ip(), port))
+        } else if rootless_proxy {
+            let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
+            Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port))
+        } else {
+            None
+        };
 
         #[cfg(not(target_os = "linux"))]
         let bind_addr: Option<SocketAddr> = None;
@@ -390,15 +420,25 @@ pub async fn run_sandbox(
     let ssh_proxy_url = if matches!(policy.network.mode, NetworkMode::Proxy) {
         #[cfg(target_os = "linux")]
         {
-            netns.as_ref().map(|ns| {
+            if let Some(ns) = netns.as_ref() {
                 let port = policy
                     .network
                     .proxy
                     .as_ref()
                     .and_then(|p| p.http_addr)
                     .map_or(3128, |addr| addr.port());
-                format!("http://{}:{port}", ns.host_ip())
-            })
+                Some(format!("http://{}:{port}", ns.host_ip()))
+            } else if rootless_proxy {
+                let port = policy
+                    .network
+                    .proxy
+                    .as_ref()
+                    .and_then(|p| p.http_addr)
+                    .map_or(3128, |addr| addr.port());
+                Some(format!("http://127.0.0.1:{port}"))
+            } else {
+                None
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
