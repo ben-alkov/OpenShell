@@ -276,34 +276,77 @@ fn diagnose_image_pull_auth_failure(_gateway_name: &str) -> GatewayFailureDiagno
 }
 
 fn diagnose_k3s_dns_proxy_failure(gateway_name: &str) -> GatewayFailureDiagnosis {
-    GatewayFailureDiagnosis {
-        summary: "Cluster DNS resolution failed".to_string(),
-        explanation: "The gateway cluster started but its internal DNS proxy cannot resolve \
-            external hostnames. Docker's embedded DNS inside the container cannot reach \
-            an upstream resolver. This is typically caused by Docker not being configured \
-            with the host's DNS servers, stale Docker networking state, or (on Desktop) \
-            DNS configuration issues."
-            .to_string(),
-        recovery_steps: vec![
-            RecoveryStep::with_command(
-                "Check your host's DNS servers",
-                "resolvectl status | grep 'DNS Servers' -A2",
-            ),
-            RecoveryStep::with_command(
-                "Configure Docker to use those DNS servers \
-                 (add to /etc/docker/daemon.json, then restart Docker)",
-                "echo '{\"dns\": [\"<your-dns-server-ip>\"]}' | sudo tee /etc/docker/daemon.json \
-                 && sudo systemctl restart docker",
-            ),
-            RecoveryStep::with_command("Prune Docker networks", "docker network prune -f"),
-            RecoveryStep::with_command(
-                "Destroy and recreate the gateway",
-                format!(
-                    "openshell gateway destroy --name {gateway_name} && openshell gateway start"
+    // Detect whether the runtime is likely Podman (rootless socket path heuristic).
+    let is_podman = std::env::var("DOCKER_HOST")
+        .map(|h| h.contains("/run/user/"))
+        .unwrap_or(false);
+
+    if is_podman {
+        GatewayFailureDiagnosis {
+            summary: "Cluster DNS resolution failed".to_string(),
+            explanation: "The gateway cluster started but cannot resolve external hostnames. \
+                Under Podman, DNS is provided by aardvark-dns via the bridge gateway IP in \
+                the container's /etc/resolv.conf. If that address is unreachable from k3s \
+                pod namespaces, all image pulls fail with DNS errors."
+                .to_string(),
+            recovery_steps: vec![
+                RecoveryStep::with_command(
+                    "Check the container's resolv.conf for a routable nameserver",
+                    format!(
+                        "podman exec $(podman ps -qf name=openshell) cat /etc/resolv.conf"
+                    ),
                 ),
-            ),
-        ],
-        retryable: true,
+                RecoveryStep::with_command(
+                    "Check your host's DNS servers",
+                    "resolvectl status | grep 'DNS Servers' -A2",
+                ),
+                RecoveryStep::new(
+                    "If using a VPN, ensure the VPN's DNS servers are resolvable from \
+                     the Podman network (aardvark-dns forwards to host resolvers)",
+                ),
+                RecoveryStep::with_command(
+                    "Verify aardvark-dns is running",
+                    "pgrep -a aardvark-dns",
+                ),
+                RecoveryStep::with_command(
+                    "Destroy and recreate the gateway",
+                    format!(
+                        "openshell gateway destroy --name {gateway_name} && openshell gateway start"
+                    ),
+                ),
+            ],
+            retryable: true,
+        }
+    } else {
+        GatewayFailureDiagnosis {
+            summary: "Cluster DNS resolution failed".to_string(),
+            explanation: "The gateway cluster started but its internal DNS proxy cannot resolve \
+                external hostnames. Docker's embedded DNS inside the container cannot reach \
+                an upstream resolver. This is typically caused by Docker not being configured \
+                with the host's DNS servers, stale Docker networking state, or (on Desktop) \
+                DNS configuration issues."
+                .to_string(),
+            recovery_steps: vec![
+                RecoveryStep::with_command(
+                    "Check your host's DNS servers",
+                    "resolvectl status | grep 'DNS Servers' -A2",
+                ),
+                RecoveryStep::with_command(
+                    "Configure Docker to use those DNS servers \
+                     (add to /etc/docker/daemon.json, then restart Docker)",
+                    "echo '{\"dns\": [\"<your-dns-server-ip>\"]}' | sudo tee /etc/docker/daemon.json \
+                     && sudo systemctl restart docker",
+                ),
+                RecoveryStep::with_command("Prune Docker networks", "docker network prune -f"),
+                RecoveryStep::with_command(
+                    "Destroy and recreate the gateway",
+                    format!(
+                        "openshell gateway destroy --name {gateway_name} && openshell gateway start"
+                    ),
+                ),
+            ],
+            retryable: true,
+        }
     }
 }
 
