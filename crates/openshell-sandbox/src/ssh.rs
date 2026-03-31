@@ -500,7 +500,7 @@ impl russh::server::Handler for SshHandler {
             let input_sender = spawn_pipe_exec(
                 &self.policy,
                 self.workdir.clone(),
-                Some("/usr/lib/openssh/sftp-server".to_string()),
+                ExecMode::Direct("/usr/lib/openssh/sftp-server".to_string()),
                 session.handle(),
                 channel,
                 self.netns_fd,
@@ -600,10 +600,14 @@ impl SshHandler {
             // No PTY requested — use plain pipes so stdout/stderr are
             // separate and output has clean LF line endings.  This is the
             // path VSCode Remote-SSH exec commands take.
+            let mode = match command {
+                Some(c) => ExecMode::LoginCommand(c),
+                None => ExecMode::Shell,
+            };
             let input_sender = spawn_pipe_exec(
                 &self.policy,
                 self.workdir.clone(),
-                command,
+                mode,
                 handle,
                 channel,
                 self.netns_fd,
@@ -890,6 +894,16 @@ fn spawn_pty_shell(
     Ok((master_file, sender))
 }
 
+/// How to build the child process for pipe-based SSH channels.
+enum ExecMode {
+    /// Plain bash, no flags (shell_request without PTY).
+    Shell,
+    /// `bash -lc <command>` — sources .profile/.bashrc for env vars.
+    LoginCommand(String),
+    /// Execute binary directly, no shell wrapper (sftp-server, etc.).
+    Direct(String),
+}
+
 /// Spawn a command using plain pipes (no PTY).
 ///
 /// stdout is forwarded as SSH channel data and stderr as SSH extended data
@@ -899,7 +913,7 @@ fn spawn_pty_shell(
 fn spawn_pipe_exec(
     policy: &SandboxPolicy,
     workdir: Option<String>,
-    command: Option<String>,
+    mode: ExecMode,
     handle: Handle,
     channel: ChannelId,
     netns_fd: Option<RawFd>,
@@ -907,8 +921,8 @@ fn spawn_pipe_exec(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
-    let mut cmd = command.map_or_else(
-        || {
+    let mut cmd = match mode {
+        ExecMode::Shell => {
             // No command — read from stdin.  Do *not* pass `-i`; interactive
             // mode reads .bashrc, writes prompts to stderr, and can introduce
             // just enough latency for VS Code Remote-SSH's platform detection
@@ -916,16 +930,22 @@ fn spawn_pipe_exec(
             // stdin already reads commands line-by-line (script mode), which is
             // exactly what VS Code's local server expects.
             Command::new("/bin/bash")
-        },
-        |command| {
+        }
+        ExecMode::LoginCommand(command) => {
             let mut c = Command::new("/bin/bash");
             // Use login shell (-l) so that .profile/.bashrc are sourced and
             // tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.)
             // are available without hardcoding them here.
             c.arg("-lc").arg(command);
             c
-        },
-    );
+        }
+        ExecMode::Direct(binary) => {
+            // Execute binary directly — no shell wrapper.  sftp-server and
+            // similar binary-protocol servers must not have their stdout
+            // polluted by shell init scripts (.bashrc, .profile).
+            Command::new(binary)
+        }
+    };
 
     let (session_user, session_home) = session_user_and_home(policy);
     apply_child_env(
