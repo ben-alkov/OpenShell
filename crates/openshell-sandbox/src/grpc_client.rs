@@ -82,10 +82,21 @@ async fn connect(endpoint: &str) -> Result<OpenShellClient<Channel>> {
 
 /// Fetch sandbox policy from OpenShell server via gRPC.
 ///
+/// Result of fetching a policy from the gateway, including metadata needed
+/// for status reporting.
+pub struct FetchedPolicy {
+    pub policy: ProtoSandboxPolicy,
+    pub version: u32,
+    pub policy_source: PolicySource,
+}
+
 /// Returns `Ok(Some(policy))` when the server has a policy configured,
 /// or `Ok(None)` when the sandbox was created without a policy (the sandbox
 /// should discover one from disk or use the restrictive default).
-pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<ProtoSandboxPolicy>> {
+pub async fn fetch_policy(
+    endpoint: &str,
+    sandbox_id: &str,
+) -> Result<Option<FetchedPolicy>> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to OpenShell server");
 
     let mut client = connect(endpoint).await?;
@@ -99,7 +110,7 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
 async fn fetch_policy_with_client(
     client: &mut OpenShellClient<Channel>,
     sandbox_id: &str,
-) -> Result<Option<ProtoSandboxPolicy>> {
+) -> Result<Option<FetchedPolicy>> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -114,9 +125,18 @@ async fn fetch_policy_with_client(
         return Ok(None);
     }
 
-    Ok(Some(inner.policy.ok_or_else(|| {
+    let policy = inner.policy.ok_or_else(|| {
         miette::miette!("Server returned non-zero version but empty policy")
-    })?))
+    })?;
+
+    let policy_source = PolicySource::try_from(inner.policy_source)
+        .unwrap_or(PolicySource::Sandbox);
+
+    Ok(Some(FetchedPolicy {
+        policy,
+        version: inner.version,
+        policy_source,
+    }))
 }
 
 /// Sync a locally-discovered policy using an existing client connection.
@@ -166,6 +186,7 @@ pub async fn discover_and_sync_policy(
     // Re-fetch from the gateway to get the canonical version/hash.
     fetch_policy_with_client(&mut client, sandbox_id)
         .await?
+        .map(|f| f.policy)
         .ok_or_else(|| {
             miette::miette!("Server still returned no policy after sync — this is a bug")
         })

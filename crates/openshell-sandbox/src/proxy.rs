@@ -418,6 +418,12 @@ async fn handle_tcp_connection(
             reason = %deny_reason,
             "CONNECT",
         );
+        // Stderr fallback: the gRPC log push may be broken, so also write
+        // deny events to stderr where they are captured by container logs.
+        eprintln!(
+            "openshell: CONNECT deny dst={host_lc}:{port} binary={binary_str} \
+             reason={deny_reason}"
+        );
         emit_denial(
             &denial_tx,
             &host_lc,

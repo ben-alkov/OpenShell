@@ -118,6 +118,16 @@ impl OpaEngine {
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
             .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
 
+        // Log the number of network policies loaded for diagnostics.
+        let policy_count = data
+            .get("network_policies")
+            .and_then(|v| v.as_object())
+            .map_or(0, |m| m.len());
+        tracing::info!(
+            network_policies = policy_count,
+            "OPA engine loading policy data"
+        );
+
         // Validate BEFORE expanding presets
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
         for w in &warnings {

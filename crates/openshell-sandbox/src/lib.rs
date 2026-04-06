@@ -1198,10 +1198,11 @@ async fn load_policy(
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
-        let proto_policy = grpc_client::fetch_policy(endpoint, id).await?;
+        let fetched = grpc_client::fetch_policy(endpoint, id).await?;
 
-        let mut proto_policy = match proto_policy {
-            Some(p) => p,
+        // Track version/source for status reporting after load.
+        let (mut proto_policy, fetched_version, fetched_source) = match fetched {
+            Some(f) => (f.policy, Some(f.version), Some(f.policy_source)),
             None => {
                 // No policy configured on the server. Discover from disk or
                 // fall back to the restrictive default, then sync to the
@@ -1220,7 +1221,10 @@ async fn load_policy(
 
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
-                grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered).await?
+                let synced =
+                    grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered)
+                        .await?;
+                (synced, None, None)
             }
         };
 
@@ -1246,6 +1250,28 @@ async fn load_policy(
         // always required for allow/deny decisions.
         info!("Creating OPA engine from proto policy data");
         let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
+
+        // Report policy load status to the gateway so the CLI shows
+        // Active > 0 instead of permanently "Pending".
+        if let (Some(version), Some(source)) = (fetched_version, fetched_source) {
+            use openshell_core::proto::PolicySource;
+            if version > 0 && source == PolicySource::Sandbox {
+                match grpc_client::CachedOpenShellClient::connect(endpoint).await {
+                    Ok(client) => {
+                        if let Err(e) =
+                            client.report_policy_status(id, version, true, "").await
+                        {
+                            warn!(error = %e, "Failed to report initial policy load status");
+                        } else {
+                            info!(version, "Reported initial policy load status");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to connect for policy status report");
+                    }
+                }
+            }
+        }
 
         let policy = SandboxPolicy::try_from(proto_policy)?;
         return Ok((policy, opa_engine));
@@ -1556,7 +1582,7 @@ async fn run_policy_poll_loop(
         let result = match client.poll_settings(sandbox_id).await {
             Ok(r) => r,
             Err(e) => {
-                debug!(error = %e, "Settings poll: server unreachable, will retry");
+                warn!(error = %e, "Settings poll: server unreachable, will retry");
                 continue;
             }
         };

@@ -8,6 +8,7 @@
 //! communicate through the proxy running on the host side of the veth.
 
 use miette::{IntoDiagnostic, Result};
+use nix::unistd;
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
@@ -879,6 +880,111 @@ fn run_in_ns(pid: u32, cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Install bypass detection rules in the current (default) network namespace.
+///
+/// Used in rootless mode where a separate network namespace cannot be created.
+/// The rules force sandbox-user traffic through the proxy and REJECT direct
+/// connections, while allowing the supervisor process (which shares this netns)
+/// to reach the cluster network for gRPC, DNS, etc.
+///
+/// In the non-rootless path the supervisor lives in a different network
+/// namespace, so blanket REJECT rules are safe. Here we use
+/// `-m owner --uid-owner` to exempt the supervisor's UID, giving equivalent
+/// isolation without a separate netns.
+pub fn install_bypass_rules_default_netns(proxy_port: u16) -> Result<()> {
+    let iptables_path = match find_iptables() {
+        Some(path) => path,
+        None => {
+            warn!("iptables not found; rootless bypass detection unavailable");
+            return Ok(());
+        }
+    };
+
+    let proxy_port_str = proxy_port.to_string();
+    let log_prefix = "openshell:bypass:rootless:";
+    let supervisor_uid = unistd::geteuid().to_string();
+
+    info!(
+        proxy_port,
+        supervisor_uid = %supervisor_uid,
+        "Installing bypass detection rules in default netns (rootless mode)"
+    );
+
+    // Rule 1: ACCEPT traffic to the proxy on loopback
+    run_iptables_direct(
+        &iptables_path,
+        &["-A", "OUTPUT", "-o", "lo", "-p", "tcp",
+          "--dport", &proxy_port_str, "-j", "ACCEPT"],
+    )?;
+
+    // Rule 2: ACCEPT all other loopback traffic
+    run_iptables_direct(
+        &iptables_path,
+        &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+    )?;
+
+    // Rule 3: ACCEPT established/related
+    run_iptables_direct(
+        &iptables_path,
+        &["-A", "OUTPUT", "-m", "conntrack",
+          "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+    )?;
+
+    // Rule 4: ACCEPT all traffic from the supervisor UID.
+    // The supervisor needs cluster-network access for gRPC policy polling,
+    // log push, DNS resolution, etc. In the non-rootless path these
+    // connections originate from the host netns; here we exempt by UID.
+    run_iptables_direct(
+        &iptables_path,
+        &["-A", "OUTPUT", "-m", "owner",
+          "--uid-owner", &supervisor_uid, "-j", "ACCEPT"],
+    )?;
+
+    // Rule 5: LOG TCP SYN bypass attempts (non-fatal)
+    // LOG rule failure is non-fatal — the REJECT rule still provides fast-fail.
+    if let Err(e) = run_iptables_direct(
+        &iptables_path,
+        &["-A", "OUTPUT", "-p", "tcp", "--syn",
+          "-m", "limit", "--limit", "5/sec", "--limit-burst", "10",
+          "-j", "LOG", "--log-prefix", log_prefix, "--log-uid"],
+    ) {
+        warn!(
+            error = %e,
+            "Failed to install LOG rule for TCP (xt_LOG module may not be loaded); \
+             bypass REJECT rules will still be installed"
+        );
+    }
+
+    // Rule 6: REJECT TCP bypass
+    run_iptables_direct(
+        &iptables_path,
+        &["-A", "OUTPUT", "-p", "tcp", "-j", "REJECT",
+          "--reject-with", "icmp-port-unreachable"],
+    )?;
+
+    // Rule 7: LOG UDP bypass (non-fatal)
+    if let Err(e) = run_iptables_direct(
+        &iptables_path,
+        &["-A", "OUTPUT", "-p", "udp",
+          "-m", "limit", "--limit", "5/sec", "--limit-burst", "10",
+          "-j", "LOG", "--log-prefix", log_prefix, "--log-uid"],
+    ) {
+        warn!(
+            error = %e,
+            "Failed to install LOG rule for UDP; bypass REJECT rules will still be installed"
+        );
+    }
+
+    // Rule 8: REJECT UDP bypass
+    run_iptables_direct(
+        &iptables_path,
+        &["-A", "OUTPUT", "-p", "udp", "-j", "REJECT",
+          "--reject-with", "icmp-port-unreachable"],
+    )?;
+
+    Ok(())
+}
+
 /// Run an `ip` command inside a PID-based namespace via `nsenter`.
 fn run_ip_in_ns(pid: u32, args: &[&str]) -> Result<()> {
     run_in_ns(pid, "ip", args)
@@ -887,6 +993,34 @@ fn run_ip_in_ns(pid: u32, args: &[&str]) -> Result<()> {
 /// Run an iptables command inside a PID-based namespace via `nsenter`.
 fn run_iptables_in_ns(pid: u32, iptables_cmd: &str, args: &[&str]) -> Result<()> {
     run_in_ns(pid, iptables_cmd, args)
+}
+
+/// Run an iptables command directly in the current network namespace.
+///
+/// Used by `install_bypass_rules_default_netns` in rootless mode where
+/// no separate netns exists.
+fn run_iptables_direct(iptables_cmd: &str, args: &[&str]) -> Result<()> {
+    debug!(
+        command = %format!("{} {}", iptables_cmd, args.join(" ")),
+        "Running iptables directly (no namespace)"
+    );
+
+    let output = Command::new(iptables_cmd)
+        .args(args)
+        .output()
+        .into_diagnostic()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette::miette!(
+            "{} {} failed: {}",
+            iptables_cmd,
+            args.join(" "),
+            stderr.trim()
+        ));
+    }
+
+    Ok(())
 }
 
 /// Well-known paths where iptables may be installed.
