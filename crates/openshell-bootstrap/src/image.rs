@@ -266,12 +266,15 @@ pub async fn pull_remote_image(
 
 /// Check whether an image reference looks like a locally-built image (no registry prefix).
 ///
-/// An image reference is considered "local-only" when the repository portion contains no `/`,
-/// meaning it has no registry or namespace prefix (e.g., `cluster-local:dev` vs
-/// `ghcr.io/org/image:tag` or `docker.io/library/nginx:latest`).
+/// A reference is "local" when it has no registry domain prefix. Registry
+/// domains contain a `.` (e.g. `ghcr.io/org/image`) or are `localhost`.
+/// Plain namespace/image refs like `openshell/cluster:dev` are local.
 pub(crate) fn is_local_image_ref(image_ref: &str) -> bool {
     let (repo, _tag) = parse_image_ref(image_ref);
-    !repo.contains('/')
+    match repo.split('/').next() {
+        Some(first) => !first.contains('.') && first != "localhost",
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +349,21 @@ mod tests {
         assert!(ghcr_credentials(None, None).is_none());
         assert!(ghcr_credentials(None, Some("")).is_none());
         assert!(ghcr_credentials(Some("myuser"), None).is_none());
+    }
+
+    #[test]
+    fn is_local_image_ref_detects_local_refs() {
+        // No namespace, no registry — local
+        assert!(is_local_image_ref("cluster:dev"));
+        // Namespace but no registry domain — local
+        assert!(is_local_image_ref("openshell/cluster:dev"));
+        assert!(is_local_image_ref("openshell/gateway:dev"));
+        // Registry domain (contains `.`) — not local
+        assert!(!is_local_image_ref("ghcr.io/lobstertrap/openshell/cluster:dev"));
+        assert!(!is_local_image_ref("docker.io/library/nginx:latest"));
+        assert!(!is_local_image_ref("registry.io:5000/image:v1"));
+        // localhost is a registry — not local
+        assert!(!is_local_image_ref("localhost/openshell/gateway:dev"));
     }
 
     #[test]

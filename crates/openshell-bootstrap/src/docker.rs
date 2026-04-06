@@ -558,9 +558,15 @@ pub async fn ensure_image(
         Err(err) => return Err(err).into_diagnostic(),
     }
 
-    // For local-only images (no registry prefix), give a clear error instead
-    // of attempting a pull from Docker Hub that will always fail.
+    // Podman stores locally-built images with a `localhost/` prefix
+    // (e.g. `localhost/openshell/cluster:dev`), so a bare inspect for
+    // `openshell/cluster:dev` won't find them.  Try the prefixed name
+    // before giving up.
     if image::is_local_image_ref(image_ref) {
+        let podman_ref = format!("localhost/{image_ref}");
+        if docker.inspect_image(&podman_ref).await.is_ok() {
+            return Ok(());
+        }
         return Err(miette::miette!(
             "Image '{}' not found locally. This looks like a locally-built image \
              (no registry prefix). Build it first with `mise run docker:build:gateway`.",
