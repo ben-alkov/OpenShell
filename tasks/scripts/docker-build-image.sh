@@ -187,6 +187,11 @@ COMMON_BUILD_ARGS=(
 	"$@"
 )
 
+NOCACHE_ARGS=()
+if [[ "${DOCKER_NO_CACHE:-}" == "1" ]]; then
+	NOCACHE_ARGS=(--no-cache)
+fi
+
 if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
 	# Podman: use native build (no buildx).
 	# --layers enables intermediate layer caching (Podman's equivalent of
@@ -197,6 +202,27 @@ if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
 	# defaults to HTTPS and will fail. Pass --tls-verify=false in that case.
 	podman_local_tls_args "${IMAGE_NAME:-}"
 	TLS_ARGS=(${PODMAN_TLS_ARGS[@]+"${PODMAN_TLS_ARGS[@]}"})
+
+	# Under Podman, the build container inherits the host's /etc/resolv.conf
+	# which may contain only 127.0.0.53 (systemd-resolved stub). That loopback
+	# address is unreachable from the build container's network namespace,
+	# breaking apt-get and other network operations. Resolve the real upstream
+	# DNS servers and pass them via --dns.
+	DNS_ARGS=()
+	_resolv_file=""
+	if [[ -f /run/systemd/resolve/resolv.conf ]]; then
+		_resolv_file="/run/systemd/resolve/resolv.conf"
+	elif [[ -f /etc/resolv.conf ]]; then
+		_resolv_file="/etc/resolv.conf"
+	fi
+	if [[ -n "${_resolv_file}" ]]; then
+		while IFS= read -r ns; do
+			DNS_ARGS+=(--dns "${ns}")
+		done < <(awk '/^nameserver/ {print $2}' "${_resolv_file}" | grep -v -E '^127\.' | grep -v -E '^::1$')
+	fi
+	if [[ ${#DNS_ARGS[@]} -gt 0 ]]; then
+		echo "Injecting host DNS servers into build: ${DNS_ARGS[*]}"
+	fi
 
 	# Podman doesn't auto-inject TARGETARCH/BUILDARCH like Docker buildx.
 	# Detect host architecture and add as build args if not already present.
@@ -223,7 +249,9 @@ if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
 	podman build \
 		--layers \
 		"${COMMON_BUILD_ARGS[@]}" \
+		${NOCACHE_ARGS[@]+"${NOCACHE_ARGS[@]}"} \
 		${ARCH_ARGS[@]+"${ARCH_ARGS[@]}"} \
+		${DNS_ARGS[@]+"${DNS_ARGS[@]}"} \
 		${TLS_ARGS[@]+"${TLS_ARGS[@]}"} \
 		${PODMAN_OUTPUT_ARGS[@]+"${PODMAN_OUTPUT_ARGS[@]}"} \
 		.
@@ -232,8 +260,20 @@ else
 	docker buildx build \
 		${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
 		${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
+		${NOCACHE_ARGS[@]+"${NOCACHE_ARGS[@]}"} \
 		"${COMMON_BUILD_ARGS[@]}" \
 		--provenance=false \
 		${OUTPUT_ARGS[@]+"${OUTPUT_ARGS[@]}"} \
 		.
+fi
+
+# For local builds of final images, also tag with the GHCR path so
+# `openshell gateway start` finds the image without OPENSHELL_CLUSTER_IMAGE.
+if [[ "${IS_FINAL_IMAGE}" == "1" && -z "${DOCKER_PUSH:-}" ]]; then
+	GHCR_TAG="ghcr.io/lobstertrap/openshell/${IMAGE_NAME#openshell/}:${IMAGE_TAG}"
+	LOCAL_TAG="${IMAGE_NAME}:${IMAGE_TAG}"
+	if [[ "${GHCR_TAG}" != "${LOCAL_TAG}" ]]; then
+		echo "Tagging as ${GHCR_TAG}..."
+		"${CONTAINER_RUNTIME}" tag "${LOCAL_TAG}" "${GHCR_TAG}"
+	fi
 fi

@@ -56,6 +56,10 @@ description = "Alias for build:docker:cluster:multiarch"
 depends = ["build:docker:cluster:multiarch"]
 hide = true
 
+["build:dev"]
+description = "Build CLI + cluster image for local development"
+depends = ["build:cli", "build:docker:cluster"]
+
 ["docker:cleanup"]
 description = "Remove stale images, volumes, and build cache not used by the current cluster"
 run = "scripts/docker-cleanup.sh --force"

@@ -22,3 +22,16 @@ hide = true
 description = "Check Rust formatting"
 run = "cargo fmt --all -- --check"
 hide = true
+
+["build:cli"]
+description = "Build the openshell CLI and install to .venv/bin/"
+run = [
+  "cargo build -p openshell-cli --release",
+  """
+  VENV_BIN="$(git rev-parse --show-toplevel)/.venv/bin"
+  if [ -d "$VENV_BIN" ]; then
+    cp target/release/openshell "$VENV_BIN/openshell"
+    echo "Installed to $VENV_BIN/openshell"
+  fi
+  """,
+]

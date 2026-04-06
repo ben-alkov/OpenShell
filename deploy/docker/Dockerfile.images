@@ -42,6 +42,14 @@ RUN dnf install -y fedora-repos && \
     dnf install -y cmake gcc-c++ make protobuf-compiler curl tar gzip \
     diffutils gawk findutils && dnf clean all
 
+# cmake is required by protobuf-src to compile libprotobuf from source.
+# Install from Kitware binary release — the Hummingbird repo cmake has
+# unresolvable library deps (librhash, libjsoncpp).
+ARG CMAKE_VERSION=3.31.6
+RUN ARCH=$(uname -m) && \
+    curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${ARCH}.tar.gz" \
+      | tar xz --strip-components=1 -C /usr/local
+
 COPY deploy/docker/cross-build.sh /usr/local/bin/
 RUN . cross-build.sh && install_cross_toolchain && install_sccache && add_rust_target
 
